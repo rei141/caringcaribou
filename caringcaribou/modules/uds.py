@@ -1247,6 +1247,70 @@ def read_memory(arb_id_request, arb_id_response, timeout,
                 print("\nDone!")
             return responses
 
+def write_data_by_identifier(arb_id_request, arb_id_response, did, data_hex_str, timeout, print_results=True):
+    """Sends a WriteDataByIdentifier request and prints the response."""
+    if not (0x0000 <= did <= 0xFFFF):
+        raise ValueError("DID must be between 0x0000 and 0xFFFF")
+
+    # Handle both direct hex string input and file input
+    data_bytes = []
+
+    # Check if the input is a file path
+    if data_hex_str.startswith("file:"):
+        file_path = data_hex_str[5:].strip()
+        try:
+            with open(file_path, 'rb') as f:
+                data_bytes = list(f.read())
+        except FileNotFoundError:
+            raise ValueError(f"File not found: {file_path}")
+        except IOError as e:
+            raise ValueError(f"Error reading file: {e}")
+    else:
+        # Process hex string with different possible formats:
+        # - 0xAA.BB.CC
+        # - AA.BB.CC
+        # - AABBCC
+        # - 0xAA BB CC
+        # - AA BB CC
+        try:
+            # Remove 0x prefix if present
+            clean_hex = data_hex_str.replace('0x', '')
+            # Replace dots and spaces with nothing
+            clean_hex = clean_hex.replace('.', '').replace(' ', '')
+            data_bytes = list(bytes.fromhex(clean_hex))
+        except ValueError:
+            raise ValueError("Invalid data format. Use hex bytes separated by dots or spaces (e.g., AA.BB.CC or AA BB CC) or 'file:/path/to/file' to read from a file")
+
+    if print_results:
+        print(f"Attempting to write DID 0x{did:04X} with data {list_to_hex_str(data_bytes)} to 0x{arb_id_request:X} (response from 0x{arb_id_response:X})")
+
+    with IsoTp(arb_id_request=arb_id_request, arb_id_response=arb_id_response) as tp:
+        tp.set_filter_single_arbitration_id(arb_id_response)
+        with Iso14229_1(tp) as uds_client:
+            uds_client.P3_CLIENT = timeout # Use P3_CLIENT for response timeout after request
+            # You'll need to add write_data_by_identifier to Iso14229_1 class
+            response = uds_client.write_data_by_identifier(did, data_bytes)
+
+            if print_results:
+                if response:
+                    if Iso14229_1.is_positive_response(response):
+                        print(f"Positive response: {list_to_hex_str(response)}")
+                    else:
+                        nrc = response[2] if len(response) > 2 else None
+                        nrc_name = get_negative_response_code_name(nrc) if nrc else "Unknown NRC"
+                        print(f"Negative response: {list_to_hex_str(response)} (NRC: 0x{nrc:02X} - {nrc_name})")
+                else:
+                    print("No response received (timeout).")
+            return response
+
+def __write_did_wrapper(args):
+    """Wrapper for WriteDataByIdentifier functionality"""
+    try:
+        write_data_by_identifier(args.src, args.dst, args.did, args.data, args.timeout)
+    except ValueError as e:
+        print(f"Error: {e}")
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
 
 def __parse_args(args):
     """Parser for module arguments"""
@@ -1476,6 +1540,15 @@ def __parse_args(args):
     parser_mem.add_argument("--outfile",
                             help="filename to write output to")
     parser_mem.set_defaults(func=__read_mem_wrapper)
+
+    # Write Data By Identifier (write_did)
+    write_did_parser = subparsers.add_parser("write_did", help="Write Data By Identifier (UDS Service 0x2E)")
+    write_did_parser.add_argument("src", help="arbitration ID to transmit to", type=parse_int_dec_or_hex)
+    write_did_parser.add_argument("dst", help="arbitration ID to listen to", type=parse_int_dec_or_hex)
+    write_did_parser.add_argument("did", help="Data Identifier (2 bytes hex, e.g., 0x1234)", type=lambda x: int(x, 16))
+    write_did_parser.add_argument("data", help="Data to write (hex bytes separated by dots, e.g., AA.BB.CC)", type=str)
+    write_did_parser.add_argument("-t", "--timeout", help="wait T seconds for response before timeout", type=float, default=Iso14229_1.P2_CLIENT_TIMEOUT_MS / 1000.0)
+    write_did_parser.set_defaults(func=__write_did_wrapper)
 
     # Parser for auto
     parser_auto = subparsers.add_parser("auto")
