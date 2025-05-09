@@ -1547,7 +1547,7 @@ def __parse_args(args):
     write_did_parser.add_argument("dst", help="arbitration ID to listen to", type=parse_int_dec_or_hex)
     write_did_parser.add_argument("did", help="Data Identifier (2 bytes hex, e.g., 0x1234)", type=lambda x: int(x, 16))
     write_did_parser.add_argument("data", help="Data to write (hex bytes separated by dots, e.g., AA.BB.CC)", type=str)
-    write_did_parser.add_argument("-t", "--timeout", help="wait T seconds for response before timeout", type=float, default=Iso14229_1.P2_CLIENT_TIMEOUT_MS / 1000.0)
+    write_did_parser.add_argument("-t", "--timeout", help="wait T seconds for response before timeout", type=float, default=DUMP_DID_TIMEOUT)
     write_did_parser.set_defaults(func=__write_did_wrapper)
 
     # Parser for auto
