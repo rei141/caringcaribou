@@ -107,6 +107,11 @@ DUMP_DID_MIN = 0x0000
 DUMP_DID_MAX = 0xFFFF
 DUMP_DID_TIMEOUT = 0.2
 
+DUMP_WRITABLE_DID_MIN = 0x0000
+DUMP_WRITABLE_DID_MAX = 0xFFFF
+DUMP_WRITABLE_DID_TIMEOUT = 0.2
+DEFAULT_TEST_DATA_HEX = "00"
+
 MEM_START_ADDR = 0
 MEM_LEN = 0x100
 MEM_SIZE = 0x10
@@ -1312,6 +1317,228 @@ def __write_did_wrapper(args):
     except Exception as e:
         print(f"An unexpected error occurred: {e}")
 
+def discover_writable_dids(arb_id_request, arb_id_response, timeout,
+                           min_did, max_did, test_data_hex_str, filter_nrc=None, print_results=True):
+    """
+    Scans for DIDs that can be written to using a test data pattern.
+    Returns a list of DIDs that gave a positive response and a dictionary of DIDs with NRCs.
+
+    :param arb_id_request: arbitration ID for requests
+    :param arb_id_response: arbitration ID for responses
+    :param timeout: seconds to wait for response before timeout
+    :param min_did: minimum DID to scan
+    :param max_did: maximum DID to scan
+    :param test_data_hex_str: hex string of test data to write
+    :param filter_nrc: list of NRC codes to filter out from results, or None to show all
+    :param print_results: whether to print results to stdout
+    """
+    if isinstance(timeout, float) and timeout < 0.0:
+        raise ValueError(f"Timeout value ({timeout}) cannot be negative")
+    if max_did < min_did:
+        raise ValueError(f"max_did (0x{max_did:04X}) must not be smaller than min_did (0x{min_did:04X})")
+
+    writable_dids_positive = []
+    dids_with_nrc = {}
+    # DIDs that returned an INCORRECT_MESSAGE_LENGTH_OR_INVALID_FORMAT error
+    dids_to_probe_length = []
+
+    # Convert filter_nrc to a set for faster lookups
+    filter_nrc_set = set(filter_nrc) if filter_nrc else set()
+
+    try:
+        clean_hex = test_data_hex_str.replace('0x', '').replace('.', '').replace(' ', '')
+        if not clean_hex: # Handle empty string after cleaning
+             raise ValueError("Test data cannot be empty.")
+        test_data_bytes = list(bytes.fromhex(clean_hex))
+    except ValueError as e:
+        raise ValueError(f"Invalid test_data format: '{test_data_hex_str}'. Use hex bytes (e.g., '00' or 'AA.BB.CC'). Original error: {e}")
+
+    if print_results:
+        print(f"Scanning for writable DIDs in range 0x{min_did:04X}-0x{max_did:04X}")
+        print(f"Using test data: {list_to_hex_str(test_data_bytes)} (from input: '{test_data_hex_str}')")
+        if filter_nrc:
+            filtered_nrc_names = [f"0x{nrc:02X} ({get_negative_response_code_name(nrc)})" for nrc in filter_nrc]
+            print(f"Filtering out NRCs: {', '.join(filtered_nrc_names)}")
+        print("\n--- Results ---")
+
+    with IsoTp(arb_id_request=arb_id_request, arb_id_response=arb_id_response) as tp:
+        tp.set_filter_single_arbitration_id(arb_id_response)
+        with Iso14229_1(tp) as uds_client:
+            if timeout is not None:
+                uds_client.P3_CLIENT = timeout
+
+            total_dids = max_did - min_did + 1
+            dids_tested = 0
+            positive_count = 0
+            filtered_count = 0
+
+            for did_to_test in range(min_did, max_did + 1):
+                dids_tested += 1
+                # 進捗を更新するが、詳細結果は表示しない
+                if print_results:
+                    progress_pct = (dids_tested / total_dids) * 100
+                    print(f"Testing DID 0x{did_to_test:04X}... [{dids_tested}/{total_dids} - {progress_pct:.1f}%] Found: {len(writable_dids_positive)} writable DIDs",
+                          end="\r", file=stderr)
+                    stderr.flush()
+
+                response = uds_client.write_data_by_identifier(did_to_test, test_data_bytes)
+
+                if response:
+                    if Iso14229_1.is_positive_response(response):
+                        writable_dids_positive.append(did_to_test)
+                        positive_count += 1
+                        # ポジティブレスポンスは重要なので個別に表示
+                        if print_results:
+                            print("\033[K", end="", file=stderr)  # 行をクリア
+                            print(f"DID 0x{did_to_test:04X}: Positive Response - {list_to_hex_str(response)}")
+                    else:
+                        if len(response) >= 3:
+                            nrc = response[2]
+                            # Collect DIDs with incorrect message length for later probing
+                            if nrc == NegativeResponseCodes.INCORRECT_MESSAGE_LENGTH_OR_INVALID_FORMAT:
+                                dids_to_probe_length.append(did_to_test)
+
+                            if nrc not in filter_nrc_set:
+                                nrc_name = get_negative_response_code_name(nrc)
+                                entry = f"NRC 0x{nrc:02X} ({nrc_name}) - {list_to_hex_str(response)}"
+                                if did_to_test not in dids_with_nrc:
+                                    dids_with_nrc[did_to_test] = []
+                                dids_with_nrc[did_to_test].append((nrc, entry))
+                            else:
+                                filtered_count += 1
+
+            # Probe DIDs with incorrect message length error to find valid lengths
+            if dids_to_probe_length and print_results:
+                print("\033[K", file=stderr)  # Clear line
+                print("\n--- Length Probing for DIDs with INCORRECT_MESSAGE_LENGTH_OR_INVALID_FORMAT ---")
+
+                for did_to_probe in dids_to_probe_length:
+                    print(f"\nProbing lengths for DID 0x{did_to_probe:04X}:")
+
+                    # Test with different data lengths from 1 to 16 bytes
+                    valid_lengths = []
+
+                    for length in range(1, 17):
+                        # Create test data of specific length (repeated pattern or padded zeros)
+                        if len(test_data_bytes) >= length:
+                            # Use first 'length' bytes from original test data
+                            length_test_data = test_data_bytes[:length]
+                        else:
+                            # Pad with zeros if original data is shorter than needed length
+                            length_test_data = test_data_bytes + [0] * (length - len(test_data_bytes))
+
+                        print(f"  Testing length {length}: {list_to_hex_str(length_test_data)}", end=" -> ")
+
+                        # Try with the new length
+                        response = uds_client.write_data_by_identifier(did_to_probe, length_test_data)
+
+                        if response:
+                            if Iso14229_1.is_positive_response(response):
+                                valid_lengths.append((length, "Positive Response", response))
+                                print(f"SUCCESS - Positive Response: {list_to_hex_str(response)}")
+                            else:
+                                nrc = response[2] if len(response) >= 3 else None
+                                nrc_name = get_negative_response_code_name(nrc) if nrc else "Unknown"
+
+                                if nrc != NegativeResponseCodes.INCORRECT_MESSAGE_LENGTH_OR_INVALID_FORMAT:
+                                    # Different NRC than before - might indicate correct length but other issues
+                                    valid_lengths.append((length, f"Different NRC: 0x{nrc:02X} ({nrc_name})", response))
+                                    print(f"INTERESTING - Different NRC: 0x{nrc:02X} ({nrc_name})")
+                                else:
+                                    print(f"FAIL - Still incorrect length: {list_to_hex_str(response)}")
+                        else:
+                            print("No response (timeout)")
+
+                        # Add small delay between tests
+                        time.sleep(0.1)
+
+                    if valid_lengths:
+                        print(f"  Valid data lengths for DID 0x{did_to_probe:04X}:")
+                        for length, result_type, resp in valid_lengths:
+                            print(f"    Length {length}: {result_type} - {list_to_hex_str(resp)}")
+                    else:
+                        print(f"  No valid data lengths found for DID 0x{did_to_probe:04X}")
+
+            # 最終的な進捗表示をクリア
+            if print_results:
+                print("\033[K", file=stderr)
+                print(f"\nScan completed: {dids_tested} DIDs tested, {positive_count} writable, {filtered_count} filtered")
+                print("\n--- Scan Summary ---")
+                if writable_dids_positive:
+                    print("Writable DIDs (Positive Response):")
+                    for did_val in writable_dids_positive:
+                        print(f"  0x{did_val:04X}")
+                else:
+                    print("No DIDs confirmed writable with a positive response for the given test data.")
+
+                # Group consecutive DIDs with same NRC into ranges
+                if dids_with_nrc:
+                    print("\nDIDs with Negative Responses:")
+
+                    # Convert dictionary to sorted list of (did, nrc, message) tuples
+                    all_nrc_entries = []
+                    for did_val, entries in dids_with_nrc.items():
+                        for nrc, message in entries:
+                            all_nrc_entries.append((did_val, nrc, message))
+                    all_nrc_entries.sort()
+
+                    # Group consecutive DIDs with same NRC
+                    if all_nrc_entries:
+                        current_range_start = all_nrc_entries[0][0]
+                        current_nrc = all_nrc_entries[0][1]
+                        current_message = all_nrc_entries[0][2]
+
+                        for i in range(1, len(all_nrc_entries)):
+                            did_val, nrc, message = all_nrc_entries[i]
+                            prev_did = all_nrc_entries[i-1][0]
+
+                            # If consecutive DID with same NRC, continue range
+                            if did_val == prev_did + 1 and nrc == current_nrc:
+                                continue
+                            else:
+                                # Print the previous range
+                                range_end = prev_did
+                                if current_range_start == range_end:
+                                    print(f"  DID 0x{current_range_start:04X}:")
+                                else:
+                                    print(f"  DIDs 0x{current_range_start:04X}-0x{range_end:04X}:")
+
+                                # Extract the NRC info from the message
+                                nrc_info = current_message.split(" - ")[0]
+                                print(f"    {nrc_info}")
+
+                                # Start a new range
+                                current_range_start = did_val
+                                current_nrc = nrc
+                                current_message = message
+
+                        # Print the last range
+                        last_did = all_nrc_entries[-1][0]
+                        if current_range_start == last_did:
+                            print(f"  DID 0x{current_range_start:04X}:")
+                        else:
+                            print(f"  DIDs 0x{current_range_start:04X}-0x{last_did:04X}:")
+
+                        # Extract the NRC info from the message
+                        nrc_info = current_message.split(" - ")[0]
+                        print(f"    {nrc_info}")
+
+    return writable_dids_positive, dids_with_nrc
+
+def __discover_writable_dids_wrapper(args):
+    """Wrapper for discover_writable_dids functionality"""
+    try:
+        discover_writable_dids(args.src, args.dst, args.timeout,
+                              args.min_did, args.max_did, args.test_data,
+                              filter_nrc=args.filter_nrc,
+                              print_results=True)
+    except ValueError as e:
+        print(f"Error: {e}")
+    except KeyboardInterrupt:
+        print("\nScan interrupted by user.")
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+
 def __parse_args(args):
     """Parser for module arguments"""
     parser = argparse.ArgumentParser(
@@ -1329,7 +1556,10 @@ def __parse_args(args):
   caringcaribou uds security_seed 0x3 0x1 0x733 0x633 -r 1 -d 0.5
   caringcaribou uds dump_dids 0x733 0x633
   caringcaribou uds dump_dids 0x733 0x633 --min_did 0x6300 --max_did 0x6fff -t 0.1
-  caringcaribou uds read_mem 0x733 0x633 --start_addr 0x0200 --mem_length 0x10000""")
+  caringcaribou uds read_mem 0x733 0x633 --start_addr 0x0200 --mem_length 0x10000
+  caringcaribou uds write_did 0x7E0 0x7E8 0xF190 AABBCCDD
+  caringcaribou uds discover_writable_dids 0x7E0 0x7E8 --min_did 0xF100 --max_did 0xF1FF
+  caringcaribou uds discover_writable_dids 0x7E0 0x7E8 --test_data 010203 --filter-nrc 0x31 0x33""")
     subparsers = parser.add_subparsers(dest="module_function")
     subparsers.required = True
 
@@ -1496,11 +1726,11 @@ def __parse_args(args):
                                  "timeout")
     parser_did.add_argument("--min_did",
                             type=parse_int_dec_or_hex,
-                            default=DUMP_DID_MIN,
+                            default=DUMP_WRITABLE_DID_MIN,
                             help="minimum device identifier (DID) to read (default: 0x0000)")
     parser_did.add_argument("--max_did",
                             type=parse_int_dec_or_hex,
-                            default=DUMP_DID_MAX,
+                            default=DUMP_WRITABLE_DID_MAX,
                             help="maximum device identifier (DID) to read (default: 0xFFFF)")
     parser_did.set_defaults(func=__dump_dids_wrapper)
 
@@ -1542,13 +1772,42 @@ def __parse_args(args):
     parser_mem.set_defaults(func=__read_mem_wrapper)
 
     # Write Data By Identifier (write_did)
-    write_did_parser = subparsers.add_parser("write_did", help="Write Data By Identifier (UDS Service 0x2E)")
+    write_did_parser = subparsers.add_parser("write_did")
     write_did_parser.add_argument("src", help="arbitration ID to transmit to", type=parse_int_dec_or_hex)
     write_did_parser.add_argument("dst", help="arbitration ID to listen to", type=parse_int_dec_or_hex)
     write_did_parser.add_argument("did", help="Data Identifier (2 bytes hex, e.g., 0x1234)", type=lambda x: int(x, 16))
     write_did_parser.add_argument("data", help="Data to write (hex bytes separated by dots, e.g., AA.BB.CC)", type=str)
     write_did_parser.add_argument("-t", "--timeout", help="wait T seconds for response before timeout", type=float, default=DUMP_DID_TIMEOUT)
     write_did_parser.set_defaults(func=__write_did_wrapper)
+
+    write_did_parser.set_defaults(func=__write_did_wrapper)
+
+    # Parser for discover_writable_dids
+    parser_discover_write_did = subparsers.add_parser("discover_writable_dids")
+    parser_discover_write_did.add_argument("src", type=parse_int_dec_or_hex,
+                                          help="Arbitration ID to transmit to")
+    parser_discover_write_did.add_argument("dst", type=parse_int_dec_or_hex,
+                                          help="Arbitration ID to listen to")
+    parser_discover_write_did.add_argument("--test_data", type=str,
+                                          default=DEFAULT_TEST_DATA_HEX,
+                                          help="Hex string of test data to attempt writing (e.g., '00' or 'AA.BB', "
+                                               f"default: '{DEFAULT_TEST_DATA_HEX}')")
+    parser_discover_write_did.add_argument("--min_did", type=parse_int_dec_or_hex,
+                                          default=DUMP_WRITABLE_DID_MIN,
+                                          help="Minimum DID to scan "
+                                               f"(default: 0x{DUMP_WRITABLE_DID_MIN:04X})")
+    parser_discover_write_did.add_argument("--max_did", type=parse_int_dec_or_hex,
+                                          default=DUMP_WRITABLE_DID_MAX,
+                                          help="Maximum DID to scan "
+                                               f"(default: 0x{DUMP_WRITABLE_DID_MAX:04X})")
+    parser_discover_write_did.add_argument("-t", "--timeout", type=float,
+                                          default=DUMP_WRITABLE_DID_TIMEOUT,
+                                          help="Wait T seconds for response before timeout "
+                                               f"(default: {DUMP_WRITABLE_DID_TIMEOUT})")
+    parser_discover_write_did.add_argument("--filter-nrc", type=parse_int_dec_or_hex, nargs="+",
+                                          help="Filter out specific NRC codes from results, common values: "
+                                               "0x31 (REQUEST_OUT_OF_RANGE), 0x33 (SECURITY_ACCESS_DENIED)")
+    parser_discover_write_did.set_defaults(func=__discover_writable_dids_wrapper)
 
     # Parser for auto
     parser_auto = subparsers.add_parser("auto")
