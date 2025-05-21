@@ -1,6 +1,7 @@
 import argparse
 import datetime
 import time
+from sys import stdout, stderr
 import os
 
 from sys import stdout, stderr
@@ -123,6 +124,10 @@ DEFAULT_REQUEST_UPLOAD_TIMEOUT = 2.0 # seconds for each step in upload
 DEFAULT_REQUEST_DOWNLOAD_TIMEOUT = 2.0
 DEFAULT_COMPRESSION_ENCRYPTION = 0x00
 DEFAULT_ADDRESS_LENGTH_FORMAT = 0x44
+
+DEFAULT_WRITE_MEMORY_TIMEOUT = 2.0
+DEFAULT_ADDRESS_BYTE_SIZE_WRITE = 4
+DEFAULT_SIZE_BYTE_SIZE_WRITE = 2
 
 def get_negative_response_code_name(nrc):
     """
@@ -1983,6 +1988,123 @@ def __request_download_wrapper(args):
     except Exception as e:
         print(f"An unexpected error occurred: {e}")
 
+def parse_data_input(data_hex_str_or_filepath: str) -> list[int]:
+    """Parses data input which can be a hex string or a file path."""
+    data_bytes_list = []
+    if data_hex_str_or_filepath.startswith("file:"):
+        file_path = data_hex_str_or_filepath[5:].strip()
+        if not os.path.isfile(file_path):
+            raise ValueError(f"Data file not found: {file_path}")
+        try:
+            with open(file_path, 'rb') as f:
+                data_bytes_list = list(f.read())
+        except IOError as e:
+            raise ValueError(f"Error reading data file '{file_path}': {e}")
+    else:
+        try:
+            clean_hex = data_hex_str_or_filepath.replace('0x', '').replace('.', '').replace(' ', '').replace('\\x', '')
+            if not clean_hex:
+                 raise ValueError("Data hex string is empty after cleaning.")
+            data_bytes_list = list(bytes.fromhex(clean_hex))
+        except ValueError as e_hex:
+            raise ValueError(f"Invalid data hex string format: '{data_hex_str_or_filepath}'. Error: {e_hex}")
+    if not data_bytes_list:
+        raise ValueError("No data to write (data is empty).")
+    return data_bytes_list
+
+
+def perform_write_memory_by_address(arb_id_request, arb_id_response, address, data_bytes_list,
+                                    address_field_len, size_field_len, timeout, print_results=True):
+    """
+    Performs Write Memory By Address (0x3D) operation.
+    :param address_field_len: Byte length of the memoryAddress parameter.
+    :param size_field_len: Byte length of the memorySize parameter (which describes the length of data_bytes_list).
+    """
+    if print_results:
+        print(f"Attempting Write Memory By Address (0x3D) to 0x{address:X}")
+        print(f"  Request ID: 0x{arb_id_request:X}, Response ID: 0x{arb_id_response:X}")
+        print(f"  Address Field Length: {address_field_len} bytes, Size Field Length: {size_field_len} bytes")
+        print(f"  Data to write ({len(data_bytes_list)} bytes): {list_to_hex_str(data_bytes_list[:64])}{'...' if len(data_bytes_list) > 64 else ''}")
+
+    if not (1 <= address_field_len <= 15 and 1 <= size_field_len <= 15):
+        raise ValueError("Address field length and Size field length must be between 1 and 15.")
+
+    address_and_length_format = (size_field_len << 4) | address_field_len
+
+    try:
+        mem_address_param = address.to_bytes(address_field_len, byteorder='big')
+    except OverflowError:
+        raise ValueError(f"Address 0x{address:X} is too large for the specified address field length of {address_field_len} bytes.")
+
+    actual_data_length = len(data_bytes_list)
+    try:
+        mem_size_param = actual_data_length.to_bytes(size_field_len, byteorder='big')
+    except OverflowError:
+        raise ValueError(f"Data length {actual_data_length} is too large for the specified size field length of {size_field_len} bytes.")
+
+    request_payload_list = [ServiceID.WRITE_MEMORY_BY_ADDRESS, address_and_length_format]
+    request_payload_list.extend(list(mem_address_param))
+    request_payload_list.extend(list(mem_size_param))
+    request_payload_list.extend(data_bytes_list)
+
+    with IsoTp(arb_id_request=arb_id_request, arb_id_response=arb_id_response) as tp:
+        tp.set_filter_single_arbitration_id(arb_id_response)
+        with Iso14229_1(tp) as uds:
+            if timeout is not None:
+                uds.P3_CLIENT = timeout
+
+            if print_results:
+                print(f"  Sending ({len(request_payload_list)} bytes): {list_to_hex_str(request_payload_list[:72])}{'...' if len(request_payload_list) > 72 else ''}")
+
+            tp.send_request(request_payload_list)
+            response = uds.receive_response(timeout=uds.P3_CLIENT)
+
+            if response is None:
+                print("  Error: No response received for Write Memory By Address (Timeout).")
+                return False
+
+            if print_results:
+                print(f"  Received: {list_to_hex_str(response)}")
+
+            if Iso14229_1.is_positive_response(response, ServiceID.WRITE_MEMORY_BY_ADDRESS):
+                # Positive response typically is: 0x7D [alfid_echo] [address_echo_if_any]
+                # We will just check the SID for simplicity here.
+                print("  Write Memory By Address successful (Positive Response).")
+                # Further validation of echoed parameters could be added here if needed.
+                return True
+            else:
+                print("  Error: Negative response or unexpected response for Write Memory By Address.")
+                process_negative_response(response)
+                return False
+    return False # Should not be reached if logic is correct
+
+
+def __write_memory_by_address_wrapper(args):
+    """Wrapper for Write Memory By Address functionality"""
+    try:
+        data_to_write = parse_data_input(args.data)
+
+        success = perform_write_memory_by_address(
+            args.src,
+            args.dst,
+            args.address,
+            data_to_write,
+            args.address_bytes,
+            args.size_bytes,
+            args.timeout
+        )
+        if not success and args.verbose: # Added verbose for more detailed failure if any
+            print("  Write operation reported failure.")
+
+    except ValueError as e:
+        print(f"Error: {e}")
+    except KeyboardInterrupt:
+        print("\nWrite Memory By Address operation interrupted by user.")
+    except Exception as e_ex:
+        print(f"An unexpected error occurred: {e_ex}")
+        # import traceback
+        # traceback.print_exc()
+
 def __parse_args(args):
     """Parser for module arguments"""
     parser = argparse.ArgumentParser(
@@ -2001,6 +2123,8 @@ def __parse_args(args):
   caringcaribou uds dump_dids 0x733 0x633
   caringcaribou uds dump_dids 0x733 0x633 --min_did 0x6300 --max_did 0x6fff -t 0.1
   caringcaribou uds read_mem 0x733 0x633 --start_addr 0x0200 --mem_length 0x10000
+  caringcaribou uds write_memory 0x7E0 0x7E8 0x20000000 FFAA5500 --address_bytes 4 --size_bytes 1
+  caringcaribou uds write_memory 0x7E0 0x7E8 0x20000000 file:/path/to/mydata.bin -ab 4 -sb 2
   caringcaribou uds write_did 0x7E0 0x7E8 0xF190 AABBCCDD
   caringcaribou uds discover_writable_dids 0x7E0 0x7E8 --min_did 0xF100 --max_did 0xF1FF
   caringcaribou uds discover_writable_dids 0x7E0 0x7E8 --test_data 010203 --filter-nrc 0x31 0x33
@@ -2216,6 +2340,24 @@ def __parse_args(args):
     parser_mem.add_argument("--outfile",
                             help="filename to write output to")
     parser_mem.set_defaults(func=__read_mem_wrapper)
+
+    # Parser for Write Memory By Address (0x3D)
+    parser_write_memory = subparsers.add_parser("write_memory", help="Write data to an ECU's memory using UDS service 0x3D (typically RAM only). "
+                                                                    "WARNING: This can crash the ECU if used improperly. "
+                                                                    "Requires appropriate session and security access.")
+    parser_write_memory.add_argument("src", type=parse_int_dec_or_hex, help="Arbitration ID to transmit to (client ID).")
+    parser_write_memory.add_argument("dst", type=parse_int_dec_or_hex, help="Arbitration ID to listen to (server/ECU ID).")
+    parser_write_memory.add_argument("address", type=parse_int_dec_or_hex, help="Memory address on ECU to write to (e.g., 0x20000000).")
+    parser_write_memory.add_argument("data", type=str, help="Data to write. Can be a HEX string (e.g., 'AABBCCDD') or a file path (e.g., 'file:/path/to/data.bin').")
+    parser_write_memory.add_argument("--address_bytes", "-ab", type=int, default=DEFAULT_ADDRESS_BYTE_SIZE_WRITE, choices=range(1,16), metavar="{1-15}",
+                                     help=f"Length in bytes of the 'memoryAddress' parameter field (default: {DEFAULT_ADDRESS_BYTE_SIZE_WRITE}).")
+    parser_write_memory.add_argument("--size_bytes", "-sb", type=int, default=DEFAULT_SIZE_BYTE_SIZE_WRITE, choices=range(1,16), metavar="{1-15}",
+                                     help="Length in bytes of the 'memorySize' parameter field (which specifies the length of the data being written) "
+                                          f"(default: {DEFAULT_SIZE_BYTE_SIZE_WRITE}).")
+    parser_write_memory.add_argument("-t", "--timeout", type=float, default=DEFAULT_WRITE_MEMORY_TIMEOUT,
+                                     help=f"Timeout in seconds for UDS response (default: {DEFAULT_WRITE_MEMORY_TIMEOUT}s).")
+    parser_write_memory.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output.") # Inherited from parent if added there.
+    parser_write_memory.set_defaults(func=__write_memory_by_address_wrapper)
 
     # Write Data By Identifier (write_did)
     write_did_parser = subparsers.add_parser("write_did")
