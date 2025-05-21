@@ -118,6 +118,9 @@ MEM_SIZE = 0x10
 ADDR_BYTE_SIZE = 4
 MEM_LEN_BYTE_SIZE = 2
 
+DEFAULT_REQUEST_UPLOAD_TIMEOUT = 2.0 # seconds for each step in upload
+DEFAULT_COMPRESSION_ENCRYPTION = 0x00
+DEFAULT_ADDRESS_LENGTH_FORMAT = 0x44
 
 def get_negative_response_code_name(nrc):
     """
@@ -1539,6 +1542,222 @@ def __discover_writable_dids_wrapper(args):
     except Exception as e:
         print(f"An unexpected error occurred: {e}")
 
+
+def perform_request_upload(arb_id_request, arb_id_response, address, length,
+                           compression_encryption, address_length_format,
+                           outfile, timeout, print_results=True):
+    """
+    Performs the Request Upload (0x35) sequence:
+    1. Request Upload (0x35)
+    2. Transfer Data (0x36) repeatedly
+    3. Request Transfer Exit (0x37)
+    """
+    if print_results:
+        print(f"Attempting Request Upload (0x35) from address 0x{address:X} for {length} bytes.")
+        print(f"  Request ID: 0x{arb_id_request:X}, Response ID: 0x{arb_id_response:X}")
+        print(f"  Compression/Encryption: 0x{compression_encryption:02X}, Address/Length Format: 0x{address_length_format:02X}")
+        print(f"  Output file: {outfile}")
+
+    # Determine byte sizes from address_length_format
+    # High nibble is length of memorySize, low nibble is length of memoryAddress
+    addr_len_bytes = address_length_format & 0x0F
+    size_len_bytes = (address_length_format >> 4) & 0x0F
+
+    if not (1 <= addr_len_bytes <= 0xF and 1 <= size_len_bytes <= 0xF): # Max 15, practically usually 1-8
+        raise ValueError(f"Invalid addressAndLengthFormatIdentifier: 0x{address_length_format:02X}. "
+                         f"Parsed address length: {addr_len_bytes} bytes, size length: {size_len_bytes} bytes. "
+                         "Each must be between 1 and 15.")
+
+    try:
+        address_bytes = address.to_bytes(addr_len_bytes, byteorder='big')
+        length_bytes = length.to_bytes(size_len_bytes, byteorder='big')
+    except OverflowError as e:
+        raise ValueError(f"Error converting address/length to bytes with format 0x{address_length_format:02X}: {e}. "
+                         f"Address 0x{address:X} ({addr_len_bytes} bytes), Length {length} ({size_len_bytes} bytes).")
+
+    received_data = bytearray()
+    max_block_length = 0
+
+    with IsoTp(arb_id_request=arb_id_request, arb_id_response=arb_id_response) as tp:
+        tp.set_filter_single_arbitration_id(arb_id_response)
+        with Iso14229_1(tp) as uds:
+            if timeout is not None:
+                uds.P3_CLIENT = timeout # Apply timeout for UDS responses
+
+            # Step 1: Request Upload (0x35)
+            if print_results:
+                print("\n--- Step 1: Request Upload (Service 0x35) ---")
+            request_data_35 = bytes([ServiceID.REQUEST_UPLOAD, compression_encryption, address_length_format]) + address_bytes + length_bytes
+            if print_results:
+                print(f"  Sending: {list_to_hex_str(request_data_35)}")
+
+            tp.send_request(list(request_data_35)) # send_request expects a list
+            response_35 = uds.receive_response(timeout=uds.P3_CLIENT) # Use configured timeout
+
+            if response_35 is None:
+                print("  Error: No response received for Request Upload (Timeout).")
+                return False
+
+            if print_results:
+                print(f"  Received: {list_to_hex_str(response_35)}")
+
+            if Iso14229_1.is_positive_response(response_35, ServiceID.REQUEST_UPLOAD):
+                # Expected positive response: 0x75 <lengthFormatIdentifier> <maxNumberOfBlockLength>
+                # lengthFormatIdentifier (1 byte): bits 7-4: length of maxNumberOfBlockLength (e.g., 2 for 2 bytes)
+                #                                 bits 3-0: reserved (or sometimes length of address, but 0 for upload confirm)
+                # maxNumberOfBlockLength (n bytes): max size of data in TransferData response
+                if len(response_35) < 2:
+                    print(f"  Error: Positive response for Request Upload is too short: {list_to_hex_str(response_35)}")
+                    return False
+
+                lfi = response_35[1]
+                len_of_max_block_len_field = (lfi >> 4) & 0x0F # Number of bytes for maxNumberOfBlockLength
+
+                if len(response_35) < 2 + len_of_max_block_len_field:
+                    print(f"  Error: Positive response for Request Upload is too short to contain maxNumberOfBlockLength: {list_to_hex_str(response_35)}")
+                    print(f"    LFI indicated {len_of_max_block_len_field} bytes for max block length.")
+                    return False
+
+                max_block_length_bytes = response_35[2 : 2 + len_of_max_block_len_field]
+                max_block_length = int.from_bytes(bytes(max_block_length_bytes), byteorder='big')
+                if print_results:
+                    print(f"  Request Upload successful. Max block length: {max_block_length} bytes (0x{max_block_length:X})")
+                if max_block_length == 0: # Or too small
+                    print(f"  Warning: ECU reported max_block_length of {max_block_length}. This might cause issues or indicate no data.")
+                    # Allow to proceed, but it might fail or be slow. Some ECUs might send 0 if no data.
+            else:
+                print("  Error: Negative response or unexpected response for Request Upload.")
+                process_negative_response(response_35)
+                return False
+
+            # Step 2: Transfer Data (0x36)
+            if print_results:
+                print("\n--- Step 2: Transfer Data (Service 0x36) ---")
+            block_sequence_counter = 0x01
+            total_bytes_received = 0
+
+            # Ensure max_block_length is reasonable if it was not set or very small.
+            # This is a safeguard, the ECU should dictate this.
+            # If max_block_length from ECU is too small, transfers will be slow but should work.
+            # If it's 0, it implies no data or an issue.
+            if max_block_length <= 0: # If ECU gives 0 or invalid, this loop won't run correctly for actual data
+                if length > 0 :
+                    print(f"  Warning: max_block_length is {max_block_length}, but {length} bytes are expected. Transfer might not proceed correctly.")
+                else: # length is 0, nothing to transfer
+                     if print_results:
+                        print("  No data to transfer (requested length is 0).")
+
+
+            with open(outfile, 'wb') as f:
+                while total_bytes_received < length:
+                    if print_results:
+                        progress_pct = (total_bytes_received / length * 100) if length > 0 else 100
+                        print(f"\r  Requesting block {block_sequence_counter:02X}. Received {total_bytes_received}/{length} bytes ({progress_pct:.2f}%).", end="")
+
+                    request_data_36 = [ServiceID.TRANSFER_DATA, block_sequence_counter]
+                    # No data parameter from client for upload
+
+                    tp.send_request(request_data_36)
+                    response_36 = uds.receive_response(timeout=uds.P3_CLIENT)
+
+                    if response_36 is None:
+                        print("\n  Error: No response received for Transfer Data (Timeout).")
+                        return False # Or attempt retry? For now, fail.
+
+                    # No need to print every block response unless debugging
+                    # if print_results:
+                    # print(f" Received for block {block_sequence_counter:02X}: {list_to_hex_str(response_36)}")
+
+                    if Iso14229_1.is_positive_response(response_36, ServiceID.TRANSFER_DATA):
+                        if len(response_36) < 2:
+                            print(f"\n  Error: Positive response for Transfer Data is too short: {list_to_hex_str(response_36)}")
+                            return False
+                        if response_36[1] != block_sequence_counter:
+                            print(f"\n  Error: Block sequence counter mismatch. Expected 0x{block_sequence_counter:02X}, got 0x{response_36[1]:02X}.")
+                            return False
+
+                        block_data = bytes(response_36[2:])
+                        f.write(block_data)
+                        received_data.extend(block_data)
+                        total_bytes_received += len(block_data)
+
+                        if len(block_data) == 0 and total_bytes_received < length :
+                             print(f"\n  Warning: Received empty data block {block_sequence_counter:02X} but more data is expected. Transfer might be incomplete.")
+                             # Decide if this is an error or if the ECU sometimes sends empty blocks before completion.
+                             # For now, continue, but this could be a sign of trouble.
+
+                        block_sequence_counter = (block_sequence_counter + 1) % 0x100 #Wraps around 0xFF to 0x00
+                        if block_sequence_counter == 0: # Standard says it wraps to 0x00 if it was 0xFF
+                            block_sequence_counter = 0 # Some implementations might go 0x01..0xFF then 0x00 then 0x01
+                                                       # But UDS spec says "The blockSequenceCounter shall be incremented by 1 for each TransferData request/response message"
+                                                       # "The value of the blockSequenceCounter ranges from 0x00 to 0xFF"
+                                                       # "The blockSequenceCounter in the first TransferData request message shall be set to 0x01."
+                                                       # If it reaches 0xFF, the next is 0x00.
+
+                    else:
+                        if print_results: print() # Newline after progress
+                        print("  Error: Negative response or unexpected response for Transfer Data.")
+                        process_negative_response(response_36)
+                        # Check for specific NRCs like 0x24 (requestSequenceError)
+                        # if len(response_36) > 2 and response_36[2] == NegativeResponseCodes.REQUEST_SEQUENCE_ERROR:
+                        # print("  NRC 0x24 (Request Sequence Error) - possibly tried to read beyond specified size.")
+                        return False
+            if print_results:
+                print(f"\r  Transfer Data complete. Received {total_bytes_received}/{length} bytes.                         ")
+                if total_bytes_received != length:
+                     print(f"  Warning: Expected {length} bytes, but received {total_bytes_received} bytes.")
+
+
+            # Step 3: Request Transfer Exit (0x37)
+            if print_results:
+                print("\n--- Step 3: Request Transfer Exit (Service 0x37) ---")
+            request_data_37 = [ServiceID.REQUEST_TRANSFER_EXIT]
+            # No parameters for RAMN ECUs as per doc
+            if print_results:
+                print(f"  Sending: {list_to_hex_str(request_data_37)}")
+
+            tp.send_request(request_data_37)
+            response_37 = uds.receive_response(timeout=uds.P3_CLIENT)
+
+            if response_37 is None:
+                print("  Error: No response received for Request Transfer Exit (Timeout).")
+                return False
+
+            if print_results:
+                print(f"  Received: {list_to_hex_str(response_37)}")
+
+            if Iso14229_1.is_positive_response(response_37, ServiceID.REQUEST_TRANSFER_EXIT):
+                if print_results:
+                    print("  Request Transfer Exit successful.")
+            else:
+                print("  Error: Negative response or unexpected response for Request Transfer Exit.")
+                process_negative_response(response_37)
+                return False
+
+            if print_results:
+                print(f"\nUpload sequence completed. Data saved to '{outfile}'. Total bytes: {total_bytes_received}")
+            return True
+
+def __request_upload_wrapper(args):
+    """Wrapper for Request Upload functionality"""
+    try:
+        perform_request_upload(
+            args.src,
+            args.dst,
+            args.address,
+            args.length,
+            args.compression_encryption,
+            args.address_length_format,
+            args.outfile,
+            args.timeout
+        )
+    except ValueError as e:
+        print(f"Error: {e}")
+    except KeyboardInterrupt:
+        print("\nRequest Upload interrupted by user.")
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+
 def __parse_args(args):
     """Parser for module arguments"""
     parser = argparse.ArgumentParser(
@@ -1559,7 +1778,8 @@ def __parse_args(args):
   caringcaribou uds read_mem 0x733 0x633 --start_addr 0x0200 --mem_length 0x10000
   caringcaribou uds write_did 0x7E0 0x7E8 0xF190 AABBCCDD
   caringcaribou uds discover_writable_dids 0x7E0 0x7E8 --min_did 0xF100 --max_did 0xF1FF
-  caringcaribou uds discover_writable_dids 0x7E0 0x7E8 --test_data 010203 --filter-nrc 0x31 0x33""")
+  caringcaribou uds discover_writable_dids 0x7E0 0x7E8 --test_data 010203 --filter-nrc 0x31 0x33
+  caringcaribou uds request_upload 0x7E0 0x7E8 0x08000000 0x100 --outfile memory_dump.bin""")
     subparsers = parser.add_subparsers(dest="module_function")
     subparsers.required = True
 
@@ -1809,6 +2029,34 @@ def __parse_args(args):
                                                "0x31 (REQUEST_OUT_OF_RANGE), 0x33 (SECURITY_ACCESS_DENIED)")
     parser_discover_write_did.set_defaults(func=__discover_writable_dids_wrapper)
 
+    # Parser for Request Upload (0x35)
+    parser_request_upload = subparsers.add_parser("request_upload", help="Request data upload from ECU (e.g., dump RAM/Flash).")
+    parser_request_upload.add_argument("src", type=parse_int_dec_or_hex,
+                                       help="Arbitration ID to transmit to (client ID).")
+    parser_request_upload.add_argument("dst", type=parse_int_dec_or_hex,
+                                       help="Arbitration ID to listen to (server/ECU ID).")
+    parser_request_upload.add_argument("address", type=parse_int_dec_or_hex,
+                                       help="Memory address to start upload from (e.g., 0x08000000).")
+    parser_request_upload.add_argument("length", type=parse_int_dec_or_hex,
+                                       help="Number of bytes to upload (e.g., 0x100 for 256 bytes).")
+    parser_request_upload.add_argument("--outfile", type=str, required=True,
+                                       help="File to save the uploaded data.")
+    parser_request_upload.add_argument("--compression_encryption", type=parse_int_dec_or_hex,
+                                       default=DEFAULT_COMPRESSION_ENCRYPTION,
+                                       help="Compression and encryption method byte "
+                                            f"(default: 0x{DEFAULT_COMPRESSION_ENCRYPTION:02X} for none).")
+    parser_request_upload.add_argument("--address_length_format", type=parse_int_dec_or_hex,
+                                       default=DEFAULT_ADDRESS_LENGTH_FORMAT,
+                                       help="Format byte for address and length fields "
+                                            f"(default: 0x{DEFAULT_ADDRESS_LENGTH_FORMAT:02X} for 4-byte address, 4-byte size). "
+                                            "High nibble=size length, Low nibble=address length.")
+    parser_request_upload.add_argument("-t", "--timeout", type=float,
+                                       default=DEFAULT_REQUEST_UPLOAD_TIMEOUT,
+                                       help="Timeout in seconds for each UDS step "
+                                            f"(default: {DEFAULT_REQUEST_UPLOAD_TIMEOUT}s).")
+    parser_request_upload.set_defaults(func=__request_upload_wrapper)
+
+
     # Parser for auto
     parser_auto = subparsers.add_parser("auto")
     parser_auto.add_argument("-min",
@@ -1863,3 +2111,5 @@ def module_main(arg_list):
         args.func(args)
     except KeyboardInterrupt:
         print("\n\nTerminated by user")
+    except Exception as e:
+        print(f"\nAn unexpected error occurred in module_main: {e}")
